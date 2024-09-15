@@ -1,5 +1,5 @@
-name: dual-meta
-type: dual-meta
+name: fscl-linear
+type: fscl-linear
 
 _phn_emb_config:
   embedding: &embedding

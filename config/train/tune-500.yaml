@@ -1,4 +1,4 @@
-scheduler_type: sqrt
+scheduler_type: const
 optimizer:
   lr: 0.0001
   batch_size: 4

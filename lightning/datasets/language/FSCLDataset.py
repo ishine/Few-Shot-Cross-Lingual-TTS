@@ -1,6 +1,7 @@
 import numpy as np
 from torch.utils.data import Dataset
 import json
+import math
 
 from dlhlp_lib.utils.tool import segment2duration
 from dlhlp_lib.utils.numeric import numpy_exist_nan
@@ -44,7 +45,7 @@ class FSCLDataset(Dataset):
         
         duration = self.data_parser.mfa_duration.read_from_query(query)
         mel = self.data_parser.mel.read_from_query(query)
-        mel = np.transpose(mel[:, :sum(duration)])
+        mel = np.transpose(mel[:, :sum(duration)]) * math.log(10)
         if self.config["pitch"]["feature"] == "phoneme_level":
             pitch = self.data_parser.mfa_duration_avg_pitch.read_from_query(query)
         else:
@@ -242,7 +243,7 @@ class UnitFSCLDataset(Dataset):
         self.config = config
 
         self.name = config["name"]
-        self.unit_name = config["unit_name"]
+        self.unit_name = config.get("unit_name", "gt")
         self.lang_id = config["lang_id"]
         self.symbol_id = config["symbol_id"]
         self.cleaners = config["text_cleaners"]
@@ -268,7 +269,7 @@ class UnitFSCLDataset(Dataset):
 
         duration = self.unit_parser.duration.read_from_query(query)
         mel = self.data_parser.mel.read_from_query(query)
-        mel = np.transpose(mel[:, :sum(duration)])
+        mel = np.transpose(mel[:, :sum(duration)]) * math.log(10)
         if self.config["pitch"]["feature"] == "phoneme_level":
             pitch = self.unit_parser.duration_avg_pitch.read_from_query(query)
         else:
@@ -310,6 +311,9 @@ class UnitFSCLDataset(Dataset):
                 assert sum(duration) == len(pitch)
         except:
             print("Length mismatch: ", query)
+            pp = self.unit_parser.phoneme.read_from_query(query)
+            print(pp)
+            print(len(pp.strip().split(" ")))
             print(len(text), len(phonemes), len(duration), len(pitch), len(energy))
             raise
 

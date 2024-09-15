@@ -34,6 +34,11 @@ class Saver(BaseSaver):
         self.visualizer = AttentionVisualizer()
         self.data_configs = data_configs
         self.id2symbols = build_id2symbols(self.data_configs)
+        increment = 0
+        self.re_id_increment = {}
+        for k, v in self.id2symbols.items():
+            self.re_id_increment[k] = increment
+            increment += len(v)
         
         self.model_config = model_config
         self.sr = AUDIO_CONFIG["audio"]["sampling_rate"]
@@ -43,6 +48,9 @@ class Saver(BaseSaver):
 
         vocoder_cls = get_vocoder(self.model_config["vocoder"]["model"])
         self.vocoder = vocoder_cls().cuda()
+
+        self.recover_text = True
+        self.re_id = True
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
         loss = outputs['losses']
@@ -59,7 +67,28 @@ class Saver(BaseSaver):
         # Synthesis one sample and log to CometLogger
         if Define.USE_COMET:
             if step % pl_module.train_config["step"]["synth_step"] == 0 and pl_module.local_rank == 0:
-                metadata = {'ids': batch[0]}
+                metadata = {
+                    'ids': _batch[0],
+                    'raw_text': _batch[1][0],
+                    'language': LANG_ID2NAME[int(_batch[-1][0].item())]
+                }
+
+                # Recover text
+                if self.recover_text:
+                    text = []
+                    lang_name = metadata["language"]
+                    for x in _batch[3][0]:
+                        if x != 0:
+                            if self.re_id:
+                                phn = self.id2symbols[lang_name][int(x - self.re_id_increment[lang_name])]
+                            else:
+                                phn = self.id2symbols[lang_name][int(x)]
+                            text.append(phn)
+                        else:
+                            break
+                    text = " ".join(text)
+                    metadata["text"] = text
+
                 fig, wav_reconstruction, wav_prediction, basename = synth_one_sample_with_target(
                     _batch, output, self.vocoder, self.model_config
                 )
@@ -114,7 +143,28 @@ class Saver(BaseSaver):
         # Log figure/audio to logger + save audio
         # One smaple for the first two batches, so synthesize two samples in total.
         if batch_idx < 2 and pl_module.local_rank == 0:
-            metadata = {'ids': batch[0]}
+            metadata = {
+                'ids': _batch[0],
+                'raw_text': _batch[1][0],
+                'language': LANG_ID2NAME[int(_batch[-1][0].item())]
+            }
+
+            # Recover text
+            if self.recover_text:
+                text = []
+                lang_name = metadata["language"]
+                for x in _batch[3][0]:
+                    if x != 0:
+                        if self.re_id:
+                            phn = self.id2symbols[lang_name][int(x - self.re_id_increment[lang_name])]
+                        else:
+                            phn = self.id2symbols[lang_name][int(x)]
+                        text.append(phn)
+                    else:
+                        break
+                text = " ".join(text)
+                metadata["text"] = text
+
             fig, wav_reconstruction, wav_prediction, basename = synth_one_sample_with_target(
                 _batch, output, self.vocoder, self.model_config
             )
@@ -122,7 +172,7 @@ class Saver(BaseSaver):
                 self.log_figure(logger, "Validation", step, basename, "", fig)
                 self.log_audio(logger, "Validation", step, basename, "reconstructed", wav_reconstruction, self.sr, metadata)
                 self.log_audio(logger, "Validation", step, basename, "synthesized", wav_prediction, self.sr, metadata)
-                plt.close(fig)
+            plt.close(fig)
 
             if synth_output is not None:
                 synth_samples(_batch, synth_output, self.vocoder, self.model_config, figure_dir, audio_dir, f"FTstep_{step}")
@@ -161,6 +211,62 @@ class Saver(BaseSaver):
 
         synth_samples(_batch, synth_output, self.vocoder, self.model_config, figure_dir, audio_dir, f"FTstep_{step}")
 
+    # New logging functions
+    def plot_tensor(self, x, title, x_labels: List[str], y_labels: List[str]):
+        "Wrapper method for calling visualizer to plot."
+        info = {
+            "title": title,
+            "x_labels": x_labels,
+            "y_labels": y_labels,
+            "attn": x.detach().cpu().numpy()
+        }
+        fig = self.visualizer.plot(info)
+        return fig
+    
+    def log_1D_tensor(self, logger, x, step, title, stage="val"):
+        """ Visualize any 1D tensors """
+        fig = self.plot_tensor(x.view(1, -1), title, [str(i) for i in range(len(x))], ["Weight"])
+        figure_name = f"{stage}/{title}/step_{step}"
+        if isinstance(logger, pl.loggers.CometLogger):
+            logger.experiment.log_figure(
+                figure_name=figure_name,
+                figure=fig,
+                step=step,
+            )
+        plt.close(fig)
+
+    def log_2D_tensor(self, logger, x, step, title, x_labels: List[str], y_labels: List[str], stage="val"):
+        """ Visualize any 2D tensors """
+        fig = self.plot_tensor(x, title, x_labels, y_labels)
+        figure_name = f"{stage}/{title}/step_{step}"
+        if isinstance(logger, pl.loggers.CometLogger):
+            logger.experiment.log_figure(
+                figure_name=figure_name,
+                figure=fig,
+                step=step,
+            )
+        plt.close(fig)
+        
+    def log_attn(self, logger, attn, batch_idx, step, title, x_labels: List[str], y_labels: List[str], stage="val"):
+        """
+        Visualize 2D attention for all heads for a sample.
+        attn: Tensor with size nH, len(y_labels), len(x_labels) (Be careful need to be opposite)
+        """
+        nH, ly, lx = attn.shape
+        assert lx == len(x_labels)
+        assert ly == len(y_labels)
+
+        for hid in range(nH):
+            fig = self.plot_tensor(attn[hid], f"Head-{hid}", x_labels, y_labels)
+            figure_name = f"{stage}/{title}/step_{step}_{batch_idx:03d}_h{hid}"
+            if isinstance(logger, pl.loggers.CometLogger):
+                logger.experiment.log_figure(
+                    figure_name=figure_name,
+                    figure=fig,
+                    step=step,
+                )
+            plt.close(fig)
+
     # For TransEmb System
     def log_codebook_attention(self, logger, attn, lang_id, batch_idx, step, stage="val"):
         """
@@ -170,39 +276,39 @@ class Saver(BaseSaver):
         lang_id = LANG_ID2NAME[lang_id]
         symbols = self.id2symbols[lang_id]
         assert n_symbols == len(symbols)
+        x_labels = [str(i) for i in range(codebook_size)]
+        y_labels = symbols
+        self.log_attn(logger, attn[0], batch_idx, step, "codebook", x_labels, y_labels, stage=stage)
 
-        for hid in range(nH):
-            info = {
-                "title": f"Head-{hid}",
-                "x_labels": [str(i) for i in range(codebook_size)],
-                "y_labels": symbols,
-                "attn": attn[0][hid].detach().cpu().numpy()
-            }
+        # Deprecated
+        # for hid in range(nH):
+        #     info = {
+        #         "title": f"Head-{hid}",
+        #         "x_labels": [str(i) for i in range(codebook_size)],
+        #         "y_labels": symbols,
+        #         "attn": attn[0][hid].detach().cpu().numpy()
+        #     }
             
-            fig = self.visualizer.plot(info)
-            figure_name = f"{stage}/codebook/step_{step}_{batch_idx:03d}_h{hid}"
-            if isinstance(logger, pl.loggers.CometLogger):
-                logger.experiment.log_figure(
-                    figure_name=figure_name,
-                    figure=fig,
-                    step=step,
-                )
-            plt.close(fig)
+        #     fig = self.visualizer.plot(info)
+        #     figure_name = f"{stage}/codebook/step_{step}_{batch_idx:03d}_h{hid}"
+        #     if isinstance(logger, pl.loggers.CometLogger):
+        #         logger.experiment.log_figure(
+        #             figure_name=figure_name,
+        #             figure=fig,
+        #             step=step,
+        #         )
+        #     plt.close(fig)
     
     def log_layer_weights(self, logger, layer_weights, step, stage="val"):
-        info = {
-            "title": "Layer weights",
-            "x_labels": [str(i) for i in range(len(layer_weights))],
-            "y_labels": ["Weight"],
-            "attn": layer_weights.view(1, -1).detach().cpu().numpy()
-        }
-        
-        fig = self.visualizer.plot(info)
-        figure_name = f"{stage}/weights/step_{step}"
-        if isinstance(logger, pl.loggers.CometLogger):
-            logger.experiment.log_figure(
-                figure_name=figure_name,
-                figure=fig,
-                step=step,
-            )
-        plt.close(fig)
+        self.log_1D_tensor(logger, layer_weights, step, "Layer weights", stage=stage)
+
+        # Deprecated
+        # fig = self.visualizer.plot(info)
+        # figure_name = f"{stage}/weights/step_{step}"
+        # if isinstance(logger, pl.loggers.CometLogger):
+        #     logger.experiment.log_figure(
+        #         figure_name=figure_name,
+        #         figure=fig,
+        #         step=step,
+        #     )
+        # plt.close(fig)
